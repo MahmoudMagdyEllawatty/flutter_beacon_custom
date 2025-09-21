@@ -1,9 +1,10 @@
 package com.flutterbeacon;
 
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
-import android.content.pm.PackageManager;
 import android.os.RemoteException;
+import android.content.pm.PackageManager;
 
 import androidx.annotation.NonNull;
 
@@ -17,32 +18,20 @@ import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.EventChannel;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
-import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
 import io.flutter.plugin.common.MethodChannel.Result;
-import io.flutter.plugin.common.PluginRegistry;
-import io.flutter.plugin.common.PluginRegistry.Registrar;
 
-public class FlutterBeaconPlugin implements FlutterPlugin, ActivityAware, MethodCallHandler,
-    PluginRegistry.RequestPermissionsResultListener,
-    PluginRegistry.ActivityResultListener {
-  
+public class FlutterBeaconPlugin implements FlutterPlugin, ActivityAware, MethodChannel.MethodCallHandler {
+
   private static final BeaconParser iBeaconLayout = new BeaconParser()
-      .setBeaconLayout("m:2-3=0215,i:4-19,i:20-21,i:22-23,p:24-24");
+          .setBeaconLayout("m:2-3=0215,i:4-19,i:20-21,i:22-23,p:24-24");
 
-  static final int REQUEST_CODE_LOCATION = 1234;
-  static final int REQUEST_CODE_BLUETOOTH = 5678;
-
-  private FlutterPluginBinding flutterPluginBinding;
-  private ActivityPluginBinding activityPluginBinding;
+  // ✅ Request codes
+  public static final int REQUEST_CODE_LOCATION = 1234;
+  public static final int REQUEST_CODE_BLUETOOTH = 5678;
 
   private FlutterBeaconScanner beaconScanner;
   private FlutterBeaconBroadcast beaconBroadcast;
   private FlutterPlatform platform;
-  
-  private BeaconManager beaconManager;
-  Result flutterResult;
-  private Result flutterResultBluetooth;
-  private EventChannel.EventSink eventSinkLocationAuthorizationStatus;
 
   private MethodChannel channel;
   private EventChannel eventChannel;
@@ -50,32 +39,84 @@ public class FlutterBeaconPlugin implements FlutterPlugin, ActivityAware, Method
   private EventChannel eventChannelBluetoothState;
   private EventChannel eventChannelAuthorizationStatus;
 
-  public FlutterBeaconPlugin() {
+  private Context applicationContext;
+  private Activity activity;
+  private ActivityPluginBinding activityPluginBinding;
+  private BeaconManager beaconManager;
 
-  }
+  public Result flutterResult;
+  private Result flutterResultBluetooth;
+  private EventChannel.EventSink eventSinkLocationAuthorizationStatus;
 
-  public static void registerWith(Registrar registrar) {
-    final FlutterBeaconPlugin instance = new FlutterBeaconPlugin();
-    instance.setupChannels(registrar.messenger(), registrar.activity());
-    registrar.addActivityResultListener(instance);
-    registrar.addRequestPermissionsResultListener(instance);
-  }
+  public FlutterBeaconPlugin() {}
 
+  // --- FlutterPlugin implementation ---
   @Override
   public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
-    this.flutterPluginBinding = binding;
+    this.applicationContext = binding.getApplicationContext();
+    this.beaconManager = BeaconManager.getInstanceForApplication(applicationContext);
+
+    if (!beaconManager.getBeaconParsers().contains(iBeaconLayout)) {
+      beaconManager.getBeaconParsers().clear();
+      beaconManager.getBeaconParsers().add(iBeaconLayout);
+    }
+
+    BinaryMessenger messenger = binding.getBinaryMessenger();
+
+    channel = new MethodChannel(messenger, "flutter_beacon");
+    channel.setMethodCallHandler(this);
+
+    eventChannel = new EventChannel(messenger, "flutter_beacon_event");
+    eventChannelMonitoring = new EventChannel(messenger, "flutter_beacon_event_monitoring");
+    eventChannelBluetoothState = new EventChannel(messenger, "flutter_bluetooth_state_changed");
+    eventChannelAuthorizationStatus = new EventChannel(messenger, "flutter_authorization_status_changed");
   }
 
   @Override
   public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
-    this.flutterPluginBinding = null;
+    teardownChannels();
   }
 
+  private void teardownChannels() {
+    if (activityPluginBinding != null) {
+      activityPluginBinding.removeActivityResultListener(this::onActivityResult);
+      activityPluginBinding.removeRequestPermissionsResultListener(this::onRequestPermissionsResult);
+    }
+
+    platform = null;
+    beaconBroadcast = null;
+    beaconScanner = null;
+
+    if (channel != null) channel.setMethodCallHandler(null);
+    if (eventChannel != null) eventChannel.setStreamHandler(null);
+    if (eventChannelMonitoring != null) eventChannelMonitoring.setStreamHandler(null);
+    if (eventChannelBluetoothState != null) eventChannelBluetoothState.setStreamHandler(null);
+    if (eventChannelAuthorizationStatus != null) eventChannelAuthorizationStatus.setStreamHandler(null);
+
+    channel = null;
+    eventChannel = null;
+    eventChannelMonitoring = null;
+    eventChannelBluetoothState = null;
+    eventChannelAuthorizationStatus = null;
+  }
+
+  // --- ActivityAware implementation ---
   @Override
   public void onAttachedToActivity(@NonNull ActivityPluginBinding binding) {
     this.activityPluginBinding = binding;
+    this.activity = binding.getActivity();
 
-    setupChannels(flutterPluginBinding.getBinaryMessenger(), binding.getActivity());
+    platform = new FlutterPlatform(activity);
+    beaconScanner = new FlutterBeaconScanner(this, activity);
+    beaconBroadcast = new FlutterBeaconBroadcast(activity, iBeaconLayout);
+
+    eventChannel.setStreamHandler(beaconScanner.rangingStreamHandler);
+    eventChannelMonitoring.setStreamHandler(beaconScanner.monitoringStreamHandler);
+    eventChannelBluetoothState.setStreamHandler(new FlutterBluetoothStateReceiver(activity));
+    eventChannelAuthorizationStatus.setStreamHandler(locationAuthorizationStatusStreamHandler);
+
+    binding.addActivityResultListener(this::onActivityResult);
+    binding.addRequestPermissionsResultListener(this::onRequestPermissionsResult);
   }
 
   @Override
@@ -90,233 +131,149 @@ public class FlutterBeaconPlugin implements FlutterPlugin, ActivityAware, Method
 
   @Override
   public void onDetachedFromActivity() {
-    teardownChannels();
-  }
-
-  BeaconManager getBeaconManager() {
-    return beaconManager;
-  }
-
-  private void setupChannels(BinaryMessenger messenger, Activity activity) {
     if (activityPluginBinding != null) {
-      activityPluginBinding.addActivityResultListener(this);
-      activityPluginBinding.addRequestPermissionsResultListener(this);
+      activityPluginBinding.removeActivityResultListener(this::onActivityResult);
+      activityPluginBinding.removeRequestPermissionsResultListener(this::onRequestPermissionsResult);
     }
-
-    beaconManager = BeaconManager.getInstanceForApplication(activity.getApplicationContext());
-    if (!beaconManager.getBeaconParsers().contains(iBeaconLayout)) {
-      beaconManager.getBeaconParsers().clear();
-      beaconManager.getBeaconParsers().add(iBeaconLayout);
-    }
-
-    platform = new FlutterPlatform(activity);
-    beaconScanner = new FlutterBeaconScanner(this, activity);
-    beaconBroadcast = new FlutterBeaconBroadcast(activity, iBeaconLayout);
-
-    channel = new MethodChannel(messenger, "flutter_beacon");
-    channel.setMethodCallHandler(this);
-
-    eventChannel = new EventChannel(messenger, "flutter_beacon_event");
-    eventChannel.setStreamHandler(beaconScanner.rangingStreamHandler);
-
-    eventChannelMonitoring = new EventChannel(messenger, "flutter_beacon_event_monitoring");
-    eventChannelMonitoring.setStreamHandler(beaconScanner.monitoringStreamHandler);
-
-    eventChannelBluetoothState = new EventChannel(messenger, "flutter_bluetooth_state_changed");
-    eventChannelBluetoothState.setStreamHandler(new FlutterBluetoothStateReceiver(activity));
-
-    eventChannelAuthorizationStatus = new EventChannel(messenger, "flutter_authorization_status_changed");
-    eventChannelAuthorizationStatus.setStreamHandler(locationAuthorizationStatusStreamHandler);
-  }
-
-  private void teardownChannels() {
-    if (activityPluginBinding != null) {
-      activityPluginBinding.removeActivityResultListener(this);
-      activityPluginBinding.removeRequestPermissionsResultListener(this);
-    }
-
-    platform = null;
-    beaconBroadcast = null;
-
-    channel.setMethodCallHandler(null);
-    eventChannel.setStreamHandler(null);
-    eventChannelMonitoring.setStreamHandler(null);
-    eventChannelBluetoothState.setStreamHandler(null);
-    eventChannelAuthorizationStatus.setStreamHandler(null);
-
-    channel = null;
-    eventChannel = null;
-    eventChannelMonitoring = null;
-    eventChannelBluetoothState = null;
-    eventChannelAuthorizationStatus = null;
-
     activityPluginBinding = null;
+    activity = null;
   }
 
+  // --- MethodCallHandler implementation ---
   @Override
   public void onMethodCall(@NonNull MethodCall call, @NonNull final Result result) {
-    if (call.method.equals("initialize")) {
-      if (beaconManager != null && !beaconManager.isBound(beaconScanner.beaconConsumer)) {
-        this.flutterResult = result;
-        this.beaconManager.bind(beaconScanner.beaconConsumer);
-
-        return;
-      }
-
-      result.success(true);
+    if (beaconManager == null || activity == null) {
+      result.error("BeaconPlugin", "Plugin is not attached to an Activity or BeaconManager is not initialized.", null);
       return;
     }
 
-    if (call.method.equals("initializeAndCheck")) {
-      initializeAndCheck(result);
-      return;
-    }
-
-    if (call.method.equals("setScanPeriod")) {
-      int scanPeriod = call.argument("scanPeriod");
-      this.beaconManager.setForegroundScanPeriod(scanPeriod);
-      try {
-        this.beaconManager.updateScanPeriods();
-        result.success(true);
-      } catch (RemoteException e) {
-        result.success(false);
-      }
-    }
-
-    if (call.method.equals("setBetweenScanPeriod")) {
-      int betweenScanPeriod = call.argument("betweenScanPeriod");
-      this.beaconManager.setForegroundBetweenScanPeriod(betweenScanPeriod);
-      try {
-        this.beaconManager.updateScanPeriods();
-        result.success(true);
-      } catch (RemoteException e) {
-        result.success(false);
-      }
-    }
-
-    if (call.method.equals("setLocationAuthorizationTypeDefault")) {
-      // Android does not have the concept of "requestWhenInUse" and "requestAlways" like iOS does,
-      // so this method does nothing.
-      // (Well, in Android API 29 and higher, there is an "ACCESS_BACKGROUND_LOCATION" option,
-      //  which could perhaps be appropriate to add here as an improvement.)
-      result.success(true);
-      return;
-    }
-
-    if (call.method.equals("authorizationStatus")) {
-      result.success(platform.checkLocationServicesPermission() ? "ALLOWED" : "NOT_DETERMINED");
-      return;
-    }
-
-    if (call.method.equals("checkLocationServicesIfEnabled")) {
-      result.success(platform.checkLocationServicesIfEnabled());
-      return;
-    }
-
-    if (call.method.equals("bluetoothState")) {
-      try {
-        boolean flag = platform.checkBluetoothIfEnabled();
-        result.success(flag ? "STATE_ON" : "STATE_OFF");
-        return;
-      } catch (RuntimeException ignored) {
-
-      }
-
-      result.success("STATE_UNSUPPORTED");
-      return;
-    }
-
-    if (call.method.equals("requestAuthorization")) {
-      if (!platform.checkLocationServicesPermission()) {
-        this.flutterResult = result;
-        platform.requestAuthorization();
-        return;
-      }
-
-      // Here, location services permission is granted.
-      //
-      // It's possible location permission was granted without going through
-      // our onRequestPermissionsResult() - for example if a different flutter plugin
-      // also requested location permissions, we could end up here with
-      // checkLocationServicesPermission() returning true before we ever called requestAuthorization().
-      //
-      // In that case, we'll never get a notification posted to eventSinkLocationAuthorizationStatus
-      //
-      // So we could could have flutter code calling requestAuthorization here and expecting to see
-      // a change in eventSinkLocationAuthorizationStatus but never receiving it.
-      //
-      // Ensure an ALLOWED status (possibly duplicate) is posted back.
-      if (eventSinkLocationAuthorizationStatus != null) {
-        eventSinkLocationAuthorizationStatus.success("ALLOWED");
-      }
-
-      result.success(true);
-      return;
-    }
-
-    if (call.method.equals("openBluetoothSettings")) {
-      if (!platform.checkBluetoothIfEnabled()) {
-        this.flutterResultBluetooth = result;
-        platform.openBluetoothSettings();
-        return;
-      }
-
-      result.success(true);
-      return;
-    }
-
-    if (call.method.equals("openLocationSettings")) {
-      platform.openLocationSettings();
-      result.success(true);
-      return;
-    }
-
-    if (call.method.equals("openApplicationSettings")) {
-      result.notImplemented();
-      return;
-    }
-
-    if (call.method.equals("close")) {
-      if (beaconManager != null) {
-        beaconScanner.stopRanging();
-        beaconManager.removeAllRangeNotifiers();
-        beaconScanner.stopMonitoring();
-        beaconManager.removeAllMonitorNotifiers();
-        if (beaconManager.isBound(beaconScanner.beaconConsumer)) {
-          beaconManager.unbind(beaconScanner.beaconConsumer);
+    switch (call.method) {
+      case "initialize":
+        if (!beaconManager.isBound(beaconScanner.beaconConsumer)) {
+          this.flutterResult = result;
+          this.beaconManager.bind(beaconScanner.beaconConsumer);
+        } else {
+          result.success(true);
         }
-      }
-      result.success(true);
-      return;
-    }
+        break;
 
-    if (call.method.equals("startBroadcast")) {
-      beaconBroadcast.startBroadcast(call.arguments, result);
-      return;
-    }
+      case "initializeAndCheck":
+        initializeAndCheck(result);
+        break;
 
-    if (call.method.equals("stopBroadcast")) {
-      beaconBroadcast.stopBroadcast(result);
-      return;
-    }
+      case "setScanPeriod":
+        try {
+          int scanPeriod = call.argument("scanPeriod");
+          beaconManager.setForegroundScanPeriod(scanPeriod);
+          beaconManager.updateScanPeriods();
+          result.success(true);
+        } catch (RemoteException e) {
+          result.success(false);
+        }
+        break;
 
-    if (call.method.equals("isBroadcasting")) {
-      beaconBroadcast.isBroadcasting(result);
-      return;
-    }
+      case "setBetweenScanPeriod":
+        try {
+          int betweenScanPeriod = call.argument("betweenScanPeriod");
+          beaconManager.setForegroundBetweenScanPeriod(betweenScanPeriod);
+          beaconManager.updateScanPeriods();
+          result.success(true);
+        } catch (RemoteException e) {
+          result.success(false);
+        }
+        break;
 
-    if (call.method.equals("isBroadcastSupported")) {
-      result.success(platform.isBroadcastSupported());
-      return;
-    }
+      case "setLocationAuthorizationTypeDefault":
+        result.success(true);
+        break;
 
-    result.notImplemented();
+      case "authorizationStatus":
+        result.success(platform.checkLocationServicesPermission() ? "ALLOWED" : "NOT_DETERMINED");
+        break;
+
+      case "checkLocationServicesIfEnabled":
+        result.success(platform.checkLocationServicesIfEnabled());
+        break;
+
+      case "bluetoothState":
+        try {
+          boolean flag = platform.checkBluetoothIfEnabled();
+          result.success(flag ? "STATE_ON" : "STATE_OFF");
+        } catch (RuntimeException ignored) {
+          result.success("STATE_UNSUPPORTED");
+        }
+        break;
+
+      case "requestAuthorization":
+        if (!platform.checkLocationServicesPermission()) {
+          this.flutterResult = result;
+          platform.requestAuthorization();
+        } else {
+          if (eventSinkLocationAuthorizationStatus != null) {
+            eventSinkLocationAuthorizationStatus.success("ALLOWED");
+          }
+          result.success(true);
+        }
+        break;
+
+      case "openBluetoothSettings":
+        if (!platform.checkBluetoothIfEnabled()) {
+          this.flutterResultBluetooth = result;
+          platform.openBluetoothSettings();
+        } else {
+          result.success(true);
+        }
+        break;
+
+      case "openLocationSettings":
+        platform.openLocationSettings();
+        result.success(true);
+        break;
+
+      case "openApplicationSettings":
+        result.notImplemented();
+        break;
+
+      case "close":
+        if (beaconManager != null) {
+          beaconScanner.stopRanging();
+          beaconManager.removeAllRangeNotifiers();
+          beaconScanner.stopMonitoring();
+          beaconManager.removeAllMonitorNotifiers();
+          if (beaconManager.isBound(beaconScanner.beaconConsumer)) {
+            beaconManager.unbind(beaconScanner.beaconConsumer);
+          }
+        }
+        result.success(true);
+        break;
+
+      case "startBroadcast":
+        beaconBroadcast.startBroadcast(call.arguments, result);
+        break;
+
+      case "stopBroadcast":
+        beaconBroadcast.stopBroadcast(result);
+        break;
+
+      case "isBroadcasting":
+        beaconBroadcast.isBroadcasting(result);
+        break;
+
+      case "isBroadcastSupported":
+        result.success(platform.isBroadcastSupported());
+        break;
+
+      default:
+        result.notImplemented();
+        break;
+    }
   }
 
+  // --- Helper methods ---
   private void initializeAndCheck(Result result) {
-    if (platform.checkLocationServicesPermission()
-        && platform.checkBluetoothIfEnabled()
-        && platform.checkLocationServicesIfEnabled()) {
+    if (platform.checkLocationServicesPermission() &&
+            platform.checkBluetoothIfEnabled() &&
+            platform.checkLocationServicesIfEnabled()) {
       if (result != null) {
         result.success(true);
         return;
@@ -343,7 +300,6 @@ public class FlutterBeaconPlugin implements FlutterPlugin, ActivityAware, Method
       if (result != null) {
         this.flutterResult = result;
       }
-
       beaconManager.bind(beaconScanner.beaconConsumer);
       return;
     }
@@ -365,80 +321,42 @@ public class FlutterBeaconPlugin implements FlutterPlugin, ActivityAware, Method
     }
   };
 
-  // region ACTIVITY CALLBACK
-  @Override
-  public boolean onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-    if (requestCode != REQUEST_CODE_LOCATION) {
-      return false;
-    }
-
-    boolean locationServiceAllowed = false;
-    if (permissions.length > 0 && grantResults.length > 0) {
-      String permission = permissions[0];
-      if (!platform.shouldShowRequestPermissionRationale(permission)) {
-        int grantResult = grantResults[0];
-        if (grantResult == PackageManager.PERMISSION_GRANTED) {
-          //allowed
-          locationServiceAllowed = true;
-        }
-        if (eventSinkLocationAuthorizationStatus != null) {
-          // shouldShowRequestPermissionRationale = false, so if access wasn't granted, the user clicked DENY and checked DON'T SHOW AGAIN
-          eventSinkLocationAuthorizationStatus.success(locationServiceAllowed ? "ALLOWED" : "DENIED");
-        }
-      }
-      else {
-        // shouldShowRequestPermissionRationale = true, so the user has clicked DENY but not DON'T SHOW AGAIN, we can possibly prompt again
-        if (eventSinkLocationAuthorizationStatus != null) {
-          eventSinkLocationAuthorizationStatus.success("NOT_DETERMINED");
-        }
-      }
-    }
-    else {
-      // Permission request was cancelled (another requestPermission active, other interruptions), we can possibly prompt again
-      if (eventSinkLocationAuthorizationStatus != null) {
-        eventSinkLocationAuthorizationStatus.success("NOT_DETERMINED");
-      }
-    }
-
-    if (flutterResult != null) {
-      if (locationServiceAllowed) {
-        flutterResult.success(true);
-      } else {
-        flutterResult.error("Beacon", "location services not allowed", null);
-      }
-      this.flutterResult = null;
-    }
-
-    return locationServiceAllowed;
-  }
-
-  @Override
-  public boolean onActivityResult(int requestCode, int resultCode, Intent intent) {
-    boolean bluetoothEnabled = requestCode == REQUEST_CODE_BLUETOOTH && resultCode == Activity.RESULT_OK;
-
-    if (bluetoothEnabled) {
-      if (!platform.checkLocationServicesPermission()) {
-        platform.requestAuthorization();
-      } else {
-        if (flutterResultBluetooth != null) {
-          flutterResultBluetooth.success(true);
-          flutterResultBluetooth = null;
-        } else if (flutterResult != null) {
-          flutterResult.success(true);
-          flutterResult = null;
-        }
-      }
-    } else {
-      if (flutterResultBluetooth != null) {
-        flutterResultBluetooth.error("Beacon", "bluetooth disabled", null);
-        flutterResultBluetooth = null;
-      } else if (flutterResult != null) {
-        flutterResult.error("Beacon", "bluetooth disabled", null);
+  // --- Activity callbacks ---
+  private boolean onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+    if (requestCode == REQUEST_CODE_LOCATION) {
+      if (flutterResult != null) {
+        boolean granted = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+        flutterResult.success(granted);
         flutterResult = null;
       }
+      if (eventSinkLocationAuthorizationStatus != null) {
+        if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+          eventSinkLocationAuthorizationStatus.success("ALLOWED");
+        } else {
+          eventSinkLocationAuthorizationStatus.success("DENIED");
+        }
+      }
+      return true;
     }
-
-    return bluetoothEnabled;
+    return false;
   }
-  // endregion
+
+  private boolean onActivityResult(int requestCode, int resultCode, Intent intent) {
+    boolean bluetoothEnabled = requestCode == REQUEST_CODE_BLUETOOTH && resultCode == Activity.RESULT_OK;
+    if (requestCode == REQUEST_CODE_BLUETOOTH) {
+      if (flutterResultBluetooth != null) {
+        flutterResultBluetooth.success(bluetoothEnabled);
+        flutterResultBluetooth = null;
+      } else if (flutterResult != null) {
+        flutterResult.success(bluetoothEnabled);
+        flutterResult = null;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  public BeaconManager getBeaconManager() {
+    return beaconManager;
+  }
 }
